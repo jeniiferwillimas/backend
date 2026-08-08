@@ -1,0 +1,55 @@
+databases:
+  - name: loan-db
+    plan: starter
+    region: oregon
+
+services:
+  - type: web
+    name: loan-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    branch: main
+    preDeployCommand: >-
+      php artisan migrate --force &&
+      php artisan config:cache &&
+      php artisan route:cache &&
+      php artisan view:cache
+    envVars:
+      - key: APP_NAME
+        value: "KCB M-PESA Loans"
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "false"
+      - key: APP_KEY
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: LOG_CHANNEL
+        value: stderr
+      - key: DB_CONNECTION
+        value: pgsql
+      - key: DB_URL
+        fromDatabase:
+          name: loan-db
+          property: connectionString
+      - key: SESSION_DRIVER
+        value: database
+      - key: QUEUE_CONNECTION
+        value: database
+      - key: CACHE_STORE
+        value: database
+      - key: FILESYSTEM_DISK
+        value: local
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: MEGAPAY_API_KEY
+        sync: false
+      - key: MEGAPAY_EMAIL
+        sync: false
+      - key: MEGAPAY_INITIATE_URL
+        sync: false
+      - key: MEGAPAY_STATUS_URL
+        sync: false
