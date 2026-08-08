@@ -115,7 +115,7 @@ class MpesaPaymentController extends Controller
             $phone = $this->formatPhoneNumber($loan->phone_number);
             
             // Generate reference
-            $reference = 'KCB-LOAN-' . $loan->id . '-' . time();
+            $reference = 'KCB DATAWORKS';
 
             // Call Megapay
             $payload = [
