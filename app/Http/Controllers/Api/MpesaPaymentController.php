@@ -264,7 +264,7 @@ class MpesaPaymentController extends Controller
      * Apply a Safaricom/Megapay result payload (from callback or a status poll)
      * to the STK push, payment, and loan application records.
      */
-    private function applyTransactionResult(MpesaStkPushRequest $stkPush, array $data): void
+    private function applyTransactionResult(MpesaStkPushRequest $stkPush, array $data, bool $isPollResponse = false): void
     {
         // Megapay's /transactionstatus response is a flat shape with the real
         // Safaricom result in TransactionCode/TransactionStatus, distinct from
@@ -293,6 +293,20 @@ class MpesaPaymentController extends Controller
             $isSuccess = !$isCancelled && ($resultCode == 0 || str_contains($transactionStatus, 'complete') || str_contains($transactionStatus, 'success'));
             $receipt = $data['TransactionReceipt'] ?? null;
             $receipt = ($receipt === 'N/A') ? null : $receipt;
+        } elseif ($isPollResponse) {
+            // Megapay's status-poll response hasn't gotten Safaricom's real
+            // result yet (no TransactionCode/TransactionStatus). Its bare
+            // ResultCode here only means "your status query was understood",
+            // not the transaction outcome — treating it as a result caused
+            // payments to be marked failed within seconds of the STK push
+            // being sent, before the user could possibly have responded.
+            // Leave the record pending; the next poll will pick up the real
+            // outcome once Safaricom has resolved it.
+            Log::info('Megapay status poll has no terminal result yet, will re-check', [
+                'stk_push_id' => $stkPush->id,
+                'body' => $data,
+            ]);
+            return;
         } else {
             $resultCode = $data['ResultCode'] ?? 1;
             $resultDesc = $data['ResultDesc'] ?? null;
@@ -410,7 +424,7 @@ class MpesaPaymentController extends Controller
             }
 
             DB::transaction(function () use ($stkPush, $data) {
-                $this->applyTransactionResult($stkPush, $data);
+                $this->applyTransactionResult($stkPush, $data, true);
             });
 
             $loan->refresh();
