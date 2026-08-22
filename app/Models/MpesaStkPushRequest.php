@@ -11,6 +11,7 @@ class MpesaStkPushRequest extends Model
         'loan_application_id',
         'merchant_request_id',
         'checkout_request_id',
+        'reference',
         'local_id',
         'ld_id',
         'phone_number',

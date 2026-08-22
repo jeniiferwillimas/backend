@@ -17,6 +17,7 @@ class Payment extends Model
         'phone_number',
         'checkout_request_id',
         'merchant_request_id',
+        'reference',
         'mpesa_receipt_number',
         'transaction_id',
         'till_number',
