@@ -35,10 +35,11 @@ return [
         ],
     ],
 
-    'paystack' => [
-        'secret_key' => env('PAYSTACK_SECRET_KEY'),
-        'public_key' => env('PAYSTACK_PUBLIC_KEY'),
-        'base_url' => env('PAYSTACK_BASE_URL', 'https://api.paystack.co'),
+    'megapay' => [
+        'api_key' => env('MEGAPAY_API_KEY'),
+        'email' => env('MEGAPAY_EMAIL'),
+        'initiate_url' => env('MEGAPAY_INITIATE_URL'),
+        'status_url' => env('MEGAPAY_STATUS_URL'),
     ],
 
 ];

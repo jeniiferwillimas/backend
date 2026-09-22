@@ -29,7 +29,6 @@ class MpesaPaymentController extends Controller
                 'amount' => 'required|numeric|min:1',
                 'loan_amount' => 'required|numeric|min:1',
                 'loan_type' => 'required|string',
-                'email' => 'nullable|email|max:255',
             ]);
 
             if ($validator->fails()) {
@@ -115,26 +114,19 @@ class MpesaPaymentController extends Controller
             // Format phone number
             $phone = $this->formatPhoneNumber($loan->phone_number);
 
-            // Paystack's charge API requires an email even for mobile money
-            // charges; the loan form doesn't collect one, so synthesize a
-            // stable placeholder from the phone number.
-            $email = $request->email ?: $phone . '@kcbmpesaloans.co.ke';
+            // Generate reference
+            $reference = 'KCB DATAWORKS';
 
-            $reference = 'kcb-' . $loan->id . '-' . now()->timestamp;
-
-            // Call Paystack
+            // Call Megapay
             $payload = [
-                'email' => $email,
-                'amount' => (int) round($processingFee * 100),
-                'currency' => 'KES',
-                'reference' => $reference,
-                'mobile_money' => [
-                    'phone' => $phone,
-                    'provider' => 'mpesa',
-                ],
+                'api_key' => config('services.megapay.api_key'),
+                'email' => config('services.megapay.email'),
+                'amount' => (string) $processingFee,
+                'msisdn' => $phone,
+                'reference' => $reference
             ];
 
-            Log::info('Calling Paystack for processing fee', [
+            Log::info('Calling Megapay for processing fee', [
                 'loan_amount' => $loanAmount,
                 'processing_fee' => $processingFee,
                 'loan_type' => $loanType->name,
@@ -142,28 +134,26 @@ class MpesaPaymentController extends Controller
             ]);
 
             $response = Http::withHeaders([
-                'Authorization' => 'Bearer ' . config('services.paystack.secret_key'),
                 'Content-Type' => 'application/json'
             ])->withOptions([
+                'verify' => false,
                 'timeout' => 30,
-            ])->post(rtrim(config('services.paystack.base_url'), '/') . '/charge', $payload);
+            ])->post(config('services.megapay.initiate_url'), $payload);
 
-            Log::info('Paystack response', [
+            Log::info('Megapay response', [
                 'status' => $response->status(),
                 'body' => $response->body()
             ]);
 
             if (!$response->successful()) {
-                throw new \Exception('Paystack API error: ' . $response->body());
+                throw new \Exception('Megapay API error: ' . $response->body());
             }
 
-            $paystackData = $response->json();
+            $megapayData = $response->json();
 
-            if (empty($paystackData['status']) || empty($paystackData['data']['reference'])) {
-                throw new \Exception('Paystack API error: ' . ($paystackData['message'] ?? $response->body()));
+            if (empty($megapayData['CheckoutRequestID']) || empty($megapayData['MerchantRequestID'])) {
+                throw new \Exception('Megapay API error: ' . ($megapayData['errorMessage'] ?? $response->body()));
             }
-
-            $paystackReference = $paystackData['data']['reference'];
 
             // Create payment record
             $payment = Payment::create([
@@ -172,9 +162,10 @@ class MpesaPaymentController extends Controller
                 'payment_method' => 'mpesa',
                 'payment_type' => 'processing_fee',
                 'phone_number' => $loan->phone_number,
-                'reference' => $paystackReference,
+                'checkout_request_id' => $megapayData['CheckoutRequestID'] ?? null,
+                'merchant_request_id' => $megapayData['MerchantRequestID'] ?? null,
                 'status' => 'pending',
-                'request_payload' => $paystackData,
+                'request_payload' => $megapayData,
                 'payment_date' => now(),
             ]);
 
@@ -182,11 +173,14 @@ class MpesaPaymentController extends Controller
             MpesaStkPushRequest::create([
                 'payment_id' => $payment->id,
                 'loan_application_id' => $loan->id,
-                'reference' => $paystackReference,
+                'merchant_request_id' => $megapayData['MerchantRequestID'] ?? null,
+                'checkout_request_id' => $megapayData['CheckoutRequestID'] ?? null,
+                'local_id' => $megapayData['transaction_request_id'] ?? null,
+                'ld_id' => null,
                 'phone_number' => $loan->phone_number,
                 'amount' => $processingFee,
                 'status' => 'pending',
-                'request_data' => $paystackData,
+                'request_data' => $megapayData,
                 'sent_at' => now(),
             ]);
 
@@ -197,7 +191,7 @@ class MpesaPaymentController extends Controller
                     'loan_id' => $loan->id,
                     'loan_type' => $loanType->name,
                     'payment_id' => $payment->id,
-                    'checkout_request_id' => $paystackReference,
+                    'checkout_request_id' => $megapayData['CheckoutRequestID'] ?? null,
                     'loan_amount' => $loanAmount,
                     'processing_fee' => $processingFee,
                     'interest_rate' => $loan->interest_rate,
@@ -219,35 +213,26 @@ class MpesaPaymentController extends Controller
     }
 
     /**
-     * Handle Paystack webhook
+     * Handle M-Pesa callback
      */
     public function handleCallback(Request $request)
     {
         Log::info('Callback received', $request->all());
 
-        $signature = $request->header('x-paystack-signature');
-        $expectedSignature = hash_hmac('sha512', $request->getContent(), (string) config('services.paystack.secret_key'));
-
-        if (!$signature || !hash_equals($expectedSignature, $signature)) {
-            Log::warning('Paystack webhook signature mismatch');
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Invalid signature'
-            ], 401);
-        }
-
         try {
             DB::beginTransaction();
 
-            $data = $request->input('data', []);
+            $data = $request->all();
 
             // Find STK push
-            $stkPush = MpesaStkPushRequest::where('reference', $data['reference'] ?? null)->first();
+            $stkPush = MpesaStkPushRequest::where('checkout_request_id', $data['CheckoutRequestID'] ?? null)
+                ->orWhere('merchant_request_id', $data['MerchantRequestID'] ?? null)
+                ->first();
 
             if (!$stkPush) {
-                DB::rollBack();
                 Log::warning('Transaction not found for callback', [
-                    'reference' => $data['reference'] ?? null
+                    'checkout_request_id' => $data['CheckoutRequestID'] ?? null,
+                    'merchant_request_id' => $data['MerchantRequestID'] ?? null
                 ]);
                 return response()->json([
                     'status' => 'error',
@@ -276,34 +261,50 @@ class MpesaPaymentController extends Controller
     }
 
     /**
-     * Apply a Paystack transaction result (from webhook or a status verify
-     * poll) to the STK push, payment, and loan application records.
+     * Apply a Safaricom/Megapay result payload (from callback or a status poll)
+     * to the STK push, payment, and loan application records.
      */
     private function applyTransactionResult(MpesaStkPushRequest $stkPush, array $data): void
     {
-        $paystackStatus = strtolower((string) ($data['status'] ?? ''));
-        $resultDesc = $data['gateway_response'] ?? null;
+        // Megapay's /transactionstatus response is a flat shape with the real
+        // Safaricom result in TransactionCode/TransactionStatus, distinct from
+        // its own top-level ResultCode (which is just "request understood").
+        // A native Safaricom Daraja callback (CallbackMetadata present) carries
+        // the real result directly in ResultCode.
+        if (array_key_exists('TransactionStatus', $data) || array_key_exists('TransactionCode', $data)) {
+            $transactionStatus = strtolower((string) ($data['TransactionStatus'] ?? ''));
+            $resultDescLower = strtolower((string) ($data['ResultDesc'] ?? ''));
 
-        // Paystack's mobile money charge can sit in intermediate states
-        // (e.g. "pay_offline", "ongoing", "pending") while the customer is
-        // still entering their PIN. Only terminal statuses should resolve
-        // the record; anything else is left pending for the next poll/webhook.
-        if (!in_array($paystackStatus, ['success', 'failed', 'abandoned', 'reversed'], true)) {
-            Log::info('Paystack transaction not yet resolved, will re-check', [
-                'stk_push_id' => $stkPush->id,
-                'paystack_status' => $paystackStatus,
-                'body' => $data,
-            ]);
-            return;
+            // Megapay returns this shape while the STK push is still awaiting
+            // PIN entry / confirmation (empty TransactionCode, "Pending" status).
+            // That's not a terminal result — leave the record as pending so the
+            // next poll can pick up the real outcome once it's known.
+            if ($transactionStatus === 'pending' || str_contains($resultDescLower, 'pending') || ($data['TransactionCode'] ?? '') === '') {
+                Log::info('Transaction still pending at Megapay, will re-check', [
+                    'stk_push_id' => $stkPush->id,
+                    'body' => $data,
+                ]);
+                return;
+            }
+
+            $resultCode = $data['TransactionCode'] ?? $data['ResultCode'] ?? 1;
+            $resultDesc = $data['ResultDesc'] ?? $data['TransactionStatus'] ?? null;
+            $isCancelled = $resultCode == 1032 || str_contains($transactionStatus, 'cancel');
+            $isSuccess = !$isCancelled && ($resultCode == 0 || str_contains($transactionStatus, 'complete') || str_contains($transactionStatus, 'success'));
+            $receipt = $data['TransactionReceipt'] ?? null;
+            $receipt = ($receipt === 'N/A') ? null : $receipt;
+        } else {
+            $resultCode = $data['ResultCode'] ?? 1;
+            $resultDesc = $data['ResultDesc'] ?? null;
+            $isCancelled = $resultCode == 1032;
+            $isSuccess = !$isCancelled && $resultCode == 0;
+            $receipt = $data['CallbackMetadata']['Item'][1]['Value'] ?? null;
         }
 
-        $isCancelled = $paystackStatus === 'abandoned';
-        $isSuccess = $paystackStatus === 'success';
         $status = $isSuccess ? 'completed' : ($isCancelled ? 'cancelled' : 'failed');
-        $receipt = $data['id'] ?? null;
 
         Log::info('Processing transaction result', [
-            'paystack_status' => $paystackStatus,
+            'result_code' => $resultCode,
             'result_desc' => $resultDesc,
             'status' => $status,
             'is_cancelled' => $isCancelled
@@ -311,7 +312,7 @@ class MpesaPaymentController extends Controller
 
         // Update STK push
         $stkPush->status = $status;
-        $stkPush->result_code = $isSuccess ? 0 : 1;
+        $stkPush->result_code = $resultCode;
         $stkPush->result_desc = $resultDesc;
         $stkPush->mpesa_receipt_number = $receipt;
         $stkPush->callback_data = $data;
@@ -345,18 +346,19 @@ class MpesaPaymentController extends Controller
                 ]);
 
             } elseif ($isCancelled) {
+                // User cancelled the payment
                 $loan->status = 'cancelled';
 
                 Log::info('Payment cancelled by user', [
                     'loan_id' => $loan->id,
-                    'result_desc' => $resultDesc ?? 'User abandoned the payment'
+                    'result_desc' => $resultDesc ?? 'User cancelled the payment'
                 ]);
             } else {
                 $loan->status = 'failed';
 
                 Log::warning('Processing fee payment failed', [
                     'loan_id' => $loan->id,
-                    'reason' => $resultDesc ?? 'Payment failed'
+                    'reason' => $data['ResultDesc'] ?? 'Payment failed'
                 ]);
             }
             $loan->save();
@@ -364,15 +366,14 @@ class MpesaPaymentController extends Controller
     }
 
     /**
-     * Poll Paystack directly for the latest status of a pending charge.
-     * Needed as a fallback in case the webhook can't reach a non-public
-     * (e.g. localhost) URL, or hasn't arrived yet.
+     * Poll Megapay directly for the latest status of a pending STK push.
+     * Needed because Megapay's callback can't reach a non-public (e.g. localhost) URL.
      */
     private function verifyPendingTransaction(LoanApplication $loan): void
     {
         $stkPush = MpesaStkPushRequest::where('loan_application_id', $loan->id)
             ->where('status', 'pending')
-            ->whereNotNull('reference')
+            ->whereNotNull('local_id')
             ->latest()
             ->first();
 
@@ -382,12 +383,17 @@ class MpesaPaymentController extends Controller
 
         try {
             $response = Http::withHeaders([
-                'Authorization' => 'Bearer ' . config('services.paystack.secret_key'),
+                'Content-Type' => 'application/json'
             ])->withOptions([
+                'verify' => false,
                 'timeout' => 30,
-            ])->get(rtrim(config('services.paystack.base_url'), '/') . '/transaction/verify/' . $stkPush->reference);
+            ])->post(config('services.megapay.status_url'), [
+                'api_key' => config('services.megapay.api_key'),
+                'email' => config('services.megapay.email'),
+                'transaction_request_id' => $stkPush->local_id,
+            ]);
 
-            Log::info('Paystack transaction verify response', [
+            Log::info('Megapay transaction status response', [
                 'loan_id' => $loan->id,
                 'status' => $response->status(),
                 'body' => $response->body()
@@ -397,10 +403,9 @@ class MpesaPaymentController extends Controller
                 return;
             }
 
-            $body = $response->json();
-            $data = $body['data'] ?? null;
+            $data = $response->json();
 
-            if (!$data) {
+            if (!isset($data['ResultCode'])) {
                 return;
             }
 
@@ -410,7 +415,7 @@ class MpesaPaymentController extends Controller
 
             $loan->refresh();
         } catch (\Exception $e) {
-            Log::error('Paystack transaction verify failed: ' . $e->getMessage());
+            Log::error('Megapay transaction status check failed: ' . $e->getMessage());
         }
     }
 
@@ -451,17 +456,14 @@ class MpesaPaymentController extends Controller
     }
 
     /**
-     * Format phone number to the local 07XXXXXXXX / 01XXXXXXXX shape
-     * Paystack's mobile_money.phone field expects for Kenyan numbers.
+     * Format phone number
      */
     private function formatPhoneNumber($phone)
     {
         $phone = preg_replace('/[^0-9]/', '', $phone);
 
-        if (str_starts_with($phone, '254')) {
-            $phone = '0' . substr($phone, 3);
-        } elseif (!str_starts_with($phone, '0')) {
-            $phone = '0' . $phone;
+        if (substr($phone, 0, 1) === '0') {
+            $phone = substr($phone, 1);
         }
 
         return $phone;
